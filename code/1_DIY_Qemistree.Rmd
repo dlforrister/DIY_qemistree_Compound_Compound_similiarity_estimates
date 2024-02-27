@@ -1,0 +1,447 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+library(tidyr)
+library(dplyr)
+library(here)
+library(data.table)
+library(splitstackshape)
+#remotes::install_github("CDK-R/rinchi")
+library(rinchi)
+
+#if (!require("BiocManager", quietly = TRUE))
+#    install.packages("BiocManager")
+
+#BiocManager::install("ChemmineR")
+library(ChemmineR)
+library(chemodiv)
+
+```
+
+Load in informatino from MN
+
+clusterinfo contains the summary of all information:
+```{r}
+
+feature_table <- read.csv(here("data","xcms_all_msms_matched_only.tsv"),sep = "\t")
+Feature_Info <- data.frame(FT_ID=feature_table$Row.names,num_FT_ID =as.numeric(gsub("FT","",feature_table$Row.names)))
+
+nrow(Feature_Info)
+
+GNPS_files <- list.files(paste0(here(),"/data/gnps_output/"),recursive =T,full.names = T)
+clusterinfo <- read.csv(GNPS_files[grepl("cluster",GNPS_files)],sep = "\t")
+gnps_edges <- read.csv(GNPS_files[grepl("networkedges_selfloop",GNPS_files)],sep = "\t")
+
+Feature_Info <- left_join(Feature_Info,clusterinfo[,c("cluster.index","parent.mass","precursor.charge","precursor.mass","RTConsensus","RTMean","RTStdErr","Correlated.Features.Group.ID","componentindex","LibraryID","MQScore","Smiles")],join_by(num_FT_ID == cluster.index))
+
+Feature_Info
+names(Feature_Info)
+```
+
+Load in Info from Sirius
+
+```{r}
+#Read in Sirius Formulas Data - top hit 
+sirius_formulas <- read.csv(here("data","sirius_output","formula_identifications.tsv"),sep= "\t")
+
+Feature_Info_form <- left_join(Feature_Info,sirius_formulas %>% group_by(featureId) %>% summarise(Unique_Formulas = n_distinct(molecularFormula)),join_by(FT_ID==featureId))
+
+
+#Read in the in silico hits made by Sirius
+sirius_structures <- read.csv(here("data","sirius_output","compound_identifications.tsv"),sep= "\t")
+
+Feature_Info_form_struct <- left_join(Feature_Info_form,sirius_structures %>% group_by(featureId) %>% summarise(Unique_Smiles = n_distinct(smiles)),join_by(FT_ID==featureId))
+
+#read in Canopus_predictures as NPCassyfire classes
+canopus_predictions <- read.csv(here("data","sirius_output","canopus_compound_summary.tsv"),sep= "\t")
+
+Feature_Info_form_struct_path <- left_join(Feature_Info_form_struct,canopus_predictions %>% group_by(featureId) %>% summarise(Unique_NPClasses = n_distinct(NPC.pathway)),join_by(FT_ID==featureId))
+
+#Read in sirius predicted fragments
+sirius_pred <- read.csv(here("data","sirius_output","predictions_neg.tsv"),sep= "\t")
+
+#add in FT ID info 
+sirius_pred <- left_join(sirius_pred,sirius_formulas %>% select(featureId,id),join_by(id==id))
+sirius_pred$Pred_Frag <- as.numeric(!sirius_pred$ClassyFire.Organic.compounds=="N/A")
+
+Feature_Info_form_struct_path_frag <- left_join(Feature_Info_form_struct_path,sirius_pred %>% filter(Pred_Frag == 1) %>% group_by(featureId) %>% summarise(Unique_fragments = sum(Pred_Frag)),join_by(FT_ID==featureId))
+
+setDT(Feature_Info_form_struct_path_frag)
+
+Feature_Info_form_struct_path_frag
+```
+
+
+```{r}
+
+#90 features got library hits
+
+table(!Feature_Info_form_struct_path_frag$Smiles == "N/A")
+
+#221 recieved Sirius Predictions
+table(Feature_Info_form_struct_path_frag$Unique_Smiles>0)
+
+#327 recieved class predictions
+table(Feature_Info_form_struct_path_frag$Unique_NPClasses>0)
+
+#221  recieved 326 predictions
+table(Feature_Info_form_struct_path_frag$Unique_fragments >0)
+
+```
+
+Now to summarize the information into a single compound x compound matrix:
+
+1) Camera Similarity - Basically the compound group identity matrix 
+2) GNPS Node by Node MS matrix - easily downloaded
+3) Structure x structure Similarity based the smiles output from both GNPS and Sirius in silico predictions
+4) Pathway by Pathway Similarity this has to be done at different levels:
+  a) Pathway - Feature x 7 pathways (fatty acids,polyketides,shikimates–phenylpropanoids,terpenoids,alkaloids,amino acids/peptides,carbohydrates)
+  b) Superclass - Feature x 70
+  c) Class - Feature by 672 Classes
+
+Total Similarity will be an average of each of these 4 classes
+  
+
+*** Note it is possible to propigate uncertainty:
+  For each matrix we can include all instances of a feature - multiple scans within a GNPS network
+  For siriius each instance of a Feature + the value for x top hits 
+  Matricies are ultimately combined for each replicate to get a mean compound by compound similarity.
+  
+
+1) MS1 Compound Group similarity - this groups compounds together if they are in the same CAMERA grouping, that is if they coellute with the same RT and if they having correlated intensities across scans.
+
+```{r}
+Camera_Matrix <- Feature_Info %>% select("FT_ID","Correlated.Features.Group.ID") %>% mutate(Present=1) %>% pivot_wider(id_cols = FT_ID,names_from = "Correlated.Features.Group.ID",names_prefix = "Camera_Group_",values_from = "Present",values_fill = 0)
+
+Camera_Matrix
+row.names(Camera_Matrix) <- Camera_Matrix$FT_ID
+
+#get list of all pairwise comparisons
+pairwise_comps <- apply(combn(Feature_Info$FT_ID,2),2,paste,collapse='_')
+
+pairwise_comps_df <- cSplit(data.frame(combined=pairwise_comps),"combined",sep= "_",drop = T)
+pairwise_comps_df <- rbind(pairwise_comps_df,data.frame(combined_1 = Feature_Info$FT_ID,combined_2 = Feature_Info$FT_ID))
+
+pairwise_comps_df_all <- unique(rbind(pairwise_comps_df,data.frame(combined_1 = pairwise_comps_df$combined_2,combined_2 = pairwise_comps_df$combined_1)))
+
+#Merge on Camera groupings
+pairwise_comps_df_all_camera <- left_join(pairwise_comps_df_all,Feature_Info %>% select(FT_ID,Correlated.Features.Group.ID) %>% rename(combined_1=FT_ID,PCgroup_1=Correlated.Features.Group.ID),by = join_by(combined_1))
+
+pairwise_comps_df_all_camera <- left_join(pairwise_comps_df_all_camera,Feature_Info %>% select(FT_ID,Correlated.Features.Group.ID) %>% rename(combined_2=FT_ID,PCgroup_2=Correlated.Features.Group.ID),by = join_by(combined_2))
+
+pairwise_comps_df_all_camera$Camera_Similarity <- 0
+pairwise_comps_df_all_camera$Camera_Similarity[pairwise_comps_df_all_camera$PCgroup_1 == pairwise_comps_df_all_camera$PCgroup_2] <- 1
+
+pairwise_comps_df_all_camera <- pairwise_comps_df_all_camera %>% select(combined_1,combined_2,Camera_Similarity) %>% rename(FT_ID_1=combined_1,FT_ID_2=combined_2)
+
+pairwise_comps_df_all_camera
+```
+
+
+2) GNPS Node by Node MS matrix - This is the Cosine spectral similarity between all nodes - Note most comparisons are NA
+```{r}
+gnps_edges <- read.csv(GNPS_files[grepl("networkedges_selfloop",GNPS_files)],sep = "\t")
+
+table(Feature_Info$num_FT_ID %in% gnps_edges$CLUSTERID1)
+table(Feature_Info$num_FT_ID %in% gnps_edges$CLUSTERID2)
+
+gnps_edges_simplified <- left_join(
+    left_join(gnps_edges,Feature_Info %>% mutate(CLUSTERID1_FT_ID = FT_ID) %>% select("num_FT_ID","CLUSTERID1_FT_ID"),join_by(CLUSTERID1==num_FT_ID),keep = T),
+    Feature_Info %>% mutate(CLUSTERID2_FT_ID = FT_ID) %>% select("num_FT_ID","CLUSTERID2_FT_ID"),join_by(CLUSTERID2==num_FT_ID),keep = T) %>%
+  select(CLUSTERID1_FT_ID,CLUSTERID2_FT_ID,Cosine) 
+
+gnps_edges_simplified_self_loop <- unique(rbind(gnps_edges_simplified,data.frame(CLUSTERID1_FT_ID = Feature_Info$FT_ID,CLUSTERID2_FT_ID = Feature_Info$FT_ID,Cosine=1)))
+
+
+pairwise_comps_df_all_camera_cosine <- left_join(pairwise_comps_df_all_camera,gnps_edges_simplified_self_loop,join_by(FT_ID_1==CLUSTERID1_FT_ID,FT_ID_2==CLUSTERID2_FT_ID))
+
+
+pairwise_comps_df_all_camera_cosine
+
+# Cosine data for 2020 compound x compound comparisons. Rest are 0, highly zero inflated matrix!
+table(is.na(pairwise_comps_df_all_camera_cosine$Cosine))
+
+```
+3) Library and Insilico Similarity 
+    get a list of unique strucutres
+    Use ChemoDiv package to calculate a comp distance based on "PubChemFingerprints"
+    
+
+```{r}
+gnps_hits <- Feature_Info %>% select("FT_ID","Smiles") %>% filter(Smiles != "N/A") %>% rename(smiles=Smiles)
+
+sirius_hits <- sirius_structures %>% rename(FT_ID=featureId) %>% select("FT_ID","smiles")
+
+#get a list of unique smile hits
+unique_structures <- unique(rbind(gnps_hits,sirius_hits))
+unique_structures$compound <- paste0("compound_",1:nrow(unique_structures))
+unique_structures <- unique_structures[unique_structures$smiles !=" ",]
+unique_structures <- unique_structures %>% filter(smiles != " ",smiles != "c")
+
+#convert smiles to inchi-key
+unique_structures <- cbind(unique_structures,data.frame(inchikey=sapply(unique_structures$smiles, get.inchi.key),inchi=sapply(unique_structures$smiles, get.inchi)))
+#use compDis to determine calculate the differences between smiles based on the PubChemFingerprints
+
+unique_structuresDis <- compDis(compoundData = unique_structures[,c("compound","smiles","inchikey")],
+                         type = "PubChemFingerprint")
+
+unique_structuresDis_long <- data.table(unique_structuresDis$fingerDisMat) %>% mutate(compound=row.names(unique_structuresDis$fingerDisMat)) %>% pivot_longer(cols = compound_1:compound_483, values_to= "compDis",names_to="compound_2")
+
+comp_1_info <- unique_structures %>% rename(compound_1=compound,FT_ID_1 = FT_ID,smiles_1=smiles,inchikey_1=inchikey) %>% select("compound_1","FT_ID_1","smiles_1","inchikey_1")
+
+comp_2_info <- unique_structures %>% rename(compound_2=compound,FT_ID_2 = FT_ID,smiles_2=smiles,inchikey_2=inchikey) %>% select("compound_2","FT_ID_2","smiles_2","inchikey_2")
+
+unique_structuresDis_long_info <- left_join(
+    left_join(data.frame(unique_structuresDis_long),comp_1_info,join_by(compound==compound_1), copy = T),
+    comp_2_info,join_by(compound_2==compound_2), copy = T)
+  
+#For instances where a single Feature ID has differnt Smiles predictions - i.e. one from GNPS and one from Sirius - calculate similarity as the average of all predictions. 
+#Note this is now a compound similarity
+compDis_average <- unique_structuresDis_long_info %>% group_by(FT_ID_1,FT_ID_2) %>% summarise(compSim_mean = 1-mean(compDis))
+
+pairwise_comps_df_all_camera_cosine_structure <- left_join(pairwise_comps_df_all_camera_cosine,compDis_average,join_by(FT_ID_1==FT_ID_1,FT_ID_2==FT_ID_2))
+
+dim(pairwise_comps_df_all_camera_cosine_structure)
+
+#Check that all of the comparisons get incorporated
+length(which(!is.na(pairwise_comps_df_all_camera_cosine_structure$compSim_mean))) == length(compDis_average$compSim_mean)
+
+pairwise_comps_df_all_camera_cosine_structure
+
+```
+4) Use Canopus Predictions to compare similarity based on the compDis function and "NPClassifier"
+    Create an NPC_table
+    Use ChemoDiv package to calculate a comp distance based on "NPClassifier"
+    
+```{r}
+
+canopus_predictionsNPC_compdata <- data.frame(
+compound=canopus_predictions$id, smiles = NA,inchikey=NA)
+
+
+canopus_predictionsNPC_table <- data.frame(
+compound=canopus_predictions$id, smiles = NA,inchikey=NA,pathway=canopus_predictions$NPC.pathway,superclass=canopus_predictions$NPC.superclass,class=canopus_predictions$NPC.class)
+
+
+canopus_predictions_dist <- compDis(canopus_predictionsNPC_compdata,npcTable = canopus_predictionsNPC_table,type = "NPClassifier")
+
+
+
+unique_NPCDis_long <- data.table(canopus_predictions_dist$npcDisMat) %>% mutate(id_1=row.names(canopus_predictions_dist$npcDisMat)) %>% pivot_longer(cols = 1:ncol(data.table(canopus_predictions_dist$npcDisMat)), values_to= "NPCDis",names_to="id_2")
+
+dim(unique_NPCDis_long)
+
+comp_1_info <- canopus_predictions %>% rename(id_1=id,FT_ID_1 = featureId) %>% select("id_1","FT_ID_1")
+comp_2_info <- canopus_predictions %>% rename(id_2=id,FT_ID_2 = featureId) %>% select("id_2","FT_ID_2")
+
+
+
+unique_NPCDis_long_info <- left_join(
+    left_join(data.frame(unique_NPCDis_long),comp_1_info,join_by(id_1==id_1), copy = T),
+    comp_2_info,join_by(id_2==id_2), copy = T)
+
+
+unique_NPCDis_long_info
+dim(unique_NPCDis_long_info)
+
+NPCDis_average <- unique_NPCDis_long_info %>% group_by(FT_ID_1,FT_ID_2) %>% summarise(NPCSim_mean = 1-mean(NPCDis))
+
+pairwise_comps_df_all_camera_cosine_structure_NPC <- left_join(pairwise_comps_df_all_camera_cosine_structure,NPCDis_average,join_by(FT_ID_1==FT_ID_1,FT_ID_2==FT_ID_2))
+
+dim(pairwise_comps_df_all_camera_cosine_structure_NPC)
+
+#Did all of the comparisons get incorporated
+length(which(!is.na(pairwise_comps_df_all_camera_cosine_structure_NPC$NPCSim_mean))) == length(NPCDis_average$NPCSim_mean)
+
+pairwise_comps_df_all_camera_cosine_structure_NPC
+
+
+```
+5) Read in Sirius substructure predictions, similar to the aproach taken by Qemistree 
+      #Take Sirius predictions 
+```{r}
+
+sirius_pred_info_all  <- data.frame(id=sirius_formulas$id,FT_ID=sirius_formulas$featureId)
+
+sirius_pred_info <- left_join(sirius_pred_info_all,sirius_pred,by="id") 
+
+sirius_pred_info <- sirius_pred_info[!is.na(sirius_pred_info$ClassyFire.Organic.compounds),]
+sirius_pred_info
+
+
+sirius_frag <- data.frame(sirius_pred_info %>% select(ClassyFire.Organic.compounds:MACCS.162))
+
+#here w use the dist function based on "euclidean" which is what is done in the qemistree paper. Should be "Jaccard" if fragment probababilities are not used.
+sirius_pred_dist <- dist(data.frame(sirius_frag),diag = T,method="euclidean",upper = T)
+sirius_pred_dist_dt <- as.matrix(sirius_pred_dist)
+sirius_pred_dist_dt_long <- melt(sirius_pred_dist_dt, varnames = c("row", "col"))
+
+sirius_pred_dist_dt_long$row <- as.character(sirius_pred_dist_dt_long$row)
+sirius_pred_dist_dt_long$col <- as.character(sirius_pred_dist_dt_long$col)
+
+matrix_info <- data.frame(rows = row.names(sirius_frag),id=sirius_pred_info$id, FT_ID = sirius_pred_info$FT_ID)
+
+matrix_info_1 <- matrix_info %>% rename(rows_1=rows,FT_ID_1=FT_ID) %>% select(rows_1,FT_ID_1)
+matrix_info_2 <- matrix_info %>% rename(rows_2=rows,FT_ID_2=FT_ID) %>% select(rows_2,FT_ID_2)
+
+unique_FragDis_long_info <- left_join(
+    left_join(sirius_pred_dist_dt_long,matrix_info_1,join_by(row==rows_1), copy = T),
+    matrix_info_2,join_by(col==rows_2), copy = T)
+
+unique_FragDis_long_info$FragSim <- 1-unique_FragDis_long_info$value/max(unique_FragDis_long_info$value)
+
+FragSim_average <- unique_FragDis_long_info %>% select(FT_ID_1,FT_ID_2,FragSim) %>% group_by(FT_ID_1,FT_ID_2) %>% summarise(FragSim_mean = mean(FragSim))
+
+pairwise_comps_df_all_camera_cosine_structure_NPC_frag <- left_join(pairwise_comps_df_all_camera_cosine_structure_NPC,FragSim_average,join_by(FT_ID_1==FT_ID_1,FT_ID_2==FT_ID_2))
+
+dim(pairwise_comps_df_all_camera_cosine_structure_NPC_frag)
+
+length(which(!is.na(pairwise_comps_df_all_camera_cosine_structure_NPC_frag$FragSim_mean))) == length(FragSim_average$FragSim_mean)
+
+pairwise_comps_df_all_camera_cosine_structure_NPC_frag
+
+
+
+
+```
+
+```{R}
+
+#2020 cosine comparisons 
+table(is.na(pairwise_comps_df_all_camera_cosine_structure_NPC_frag$Cosine))
+
+#77284 compound comparisons - similarity based on predicted structures
+table(is.na(pairwise_comps_df_all_camera_cosine_structure_NPC_frag$compSim_mean))
+
+#106929 compound comparisons - similarity based on canopus predicted classes
+table(is.na(pairwise_comps_df_all_camera_cosine_structure_NPC_frag$NPCSim_mean))
+
+#106276 compound comparisons - similarity based on predicted substructures
+table(is.na(pairwise_comps_df_all_camera_cosine_structure_NPC_frag$FragSim_mean))
+
+pairwise_comps_df_all_camera_cosine_structure_NPC_frag_summary <- pairwise_comps_df_all_camera_cosine_structure_NPC_frag %>% rowwise() %>% mutate(Compound_Similarity = mean(c(Camera_Similarity, Cosine, compSim_mean,NPCSim_mean,FragSim_mean),na.rm = T),Cosine_Camera=mean(c(Camera_Similarity, Cosine),na.rm = T))
+
+pairwise_comps_df_all_camera_cosine_structure_NPC_frag_summary
+```
+
+Build a tree based on each of the following data
+
+```{r}
+
+#Choose one of the following:
+vl_from <- "Cosine_Camera" # GNPS Data Only + Camera Groupings
+vl_from <- "Compound_Similarity" #Average of all of the above
+#** these do not work now because NAs are causing problems.
+#
+#vl_from <- "compSim_mean" # Based only on smiles from GNPS and Sirius hits
+#vl_from <- "NPCSim_mean" # Based on Sirius Path predictions
+#vl_from <- "FragSim_mean" # Based on Sirius Fragment predictions
+
+Cmp_Sim_Matrix <- data.frame(pairwise_comps_df_all_camera_cosine_structure_NPC_frag_summary  %>% pivot_wider(id_cols = "FT_ID_1",names_from = "FT_ID_2",values_from = vl_from,values_fill = 0))
+row.names(Cmp_Sim_Matrix) <- Cmp_Sim_Matrix$FT_ID_1
+
+feature_order <- names(Cmp_Sim_Matrix)[-1][order(names(Cmp_Sim_Matrix)[-1])]
+
+Cmp_Sim_Matrix <- data.frame(Cmp_Sim_Matrix[feature_order,feature_order])
+
+
+write.table(Cmp_Sim_Matrix,here("results",paste0("custom_qemistree_compoundxcompound_distance_matrix_",vl_from,".tsv")),sep="\t")
+
+Cmp_Sim_Matrix[is.na(Cmp_Sim_Matrix)] <- 0
+Cmp_Sim_Matrix
+
+
+```
+Use pvclust to create Tree
+```{r}
+source(here("code","as.phylo.pvclust.R"))
+
+#This builds Tree of compounds vs compounds
+
+#Species_TIC_norm <- decostand(Species_TIC, method = "total", MARGIN = 2) 
+Species_TIC_norm <- Cmp_Sim_Matrix
+species_dist <- as.dist(1-cor(Species_TIC_norm, method="pearson"))				# Distance matrix
+species_single <- hclust(species_dist, method="single")					# Single linkage clustering
+species_ward <- hclust(species_dist, method="ward.D")					# Ward clustering
+species_complete <- hclust(species_dist, method="complete")				# Complete linkage clustering
+species_centroid <- hclust(species_dist, method="centroid")				# Centroid clustering
+species_median <- hclust(species_dist, method="median")				        # Median clustering
+#Comparison between the distance matrix and binary matrices representing partitions 
+coph1 <- cophenetic(species_single)							# Compute Patristic distances		
+coph2 <- cophenetic(species_ward)
+coph3 <- cophenetic(species_complete)
+coph4 <- cophenetic(species_centroid)
+coph5 <- cophenetic(species_median)
+a <-cor(coph1, species_dist)								#Cophenetic correlations
+b <-cor(coph2, species_dist)
+c <-cor(coph3, species_dist)
+d <-cor(coph4, species_dist)
+e <-cor(coph5, species_dist)
+method <- c("single","ward","complete", "centroid", "median")
+mhc<- method[which.max(c(a,b,c,d,e))]
+print(paste("Building tree with", mhc, "clustering"))
+result_species <- pvclust(Species_TIC_norm, method.hclust=mhc, method.dist="correlation", use.cor="pairwise.complete.obs", nboot=1000,parallel=T)
+
+#Write tree as .tre file to be edited in Figtree
+chemocode_tree<-as.phylo.pvclust(result_species)
+
+write.tree(chemocode_tree,file=here("results",paste0("custom_qemistree_compoundxcompound_tree_summary_",vl_from,".tre")))
+```
+
+Create CSCS matricies using q2-CSCS 
+
+#Note 2024 Feb 27 below this line is not working. Dale will update at some point
+```{R}
+
+
+system(paste(
+  here("code","calculate_CSCS_matrices.sh"), # file path for bash script
+  here("results"), #path for working directory
+  here("data","quantification_table_V2_2023_10_10.tsv"), #path to compound quantification table 
+  here("data","quantification_table_PA_V2_2023_10_10.tsv"))) #name of of PA table 
+
+```
+Build a tree out of the Q2-CSCS matricies created above
+```{r}
+source(here("code","as.phylo.pvclust.R"))
+
+cscs_matrices <- list.files(here("results","gnps_output","custom_qemistree"),pattern ="cscs_distance_matrix*")
+
+for (file in cscs_matrices) {
+CSCS <- read.csv(here("results",file),sep="\t",row.names = 1)
+
+Species_TIC_norm <- CSCS
+#Species_TIC_norm <- decostand(Species_TIC, method = "total", MARGIN = 2) 
+species_dist <- as.dist(1-cor(Species_TIC_norm, method="pearson"))				# Distance matrix
+species_single <- hclust(species_dist, method="single")					# Single linkage clustering
+species_ward <- hclust(species_dist, method="ward.D")					# Ward clustering
+species_complete <- hclust(species_dist, method="complete")				# Complete linkage clustering
+species_centroid <- hclust(species_dist, method="centroid")				# Centroid clustering
+species_median <- hclust(species_dist, method="median")				        # Median clustering
+#Comparison between the distance matrix and binary matrices representing partitions 
+coph1 <- cophenetic(species_single)							# Compute Patristic distances		
+coph2 <- cophenetic(species_ward)
+coph3 <- cophenetic(species_complete)
+coph4 <- cophenetic(species_centroid)
+coph5 <- cophenetic(species_median)
+a <-cor(coph1, species_dist)								#Cophenetic correlations
+b <-cor(coph2, species_dist)
+c <-cor(coph3, species_dist)
+d <-cor(coph4, species_dist)
+e <-cor(coph5, species_dist)
+method <- c("single","ward","complete", "centroid", "median")
+mhc<- method[which.max(c(a,b,c,d,e))]
+result_species <- pvclust(Species_TIC_norm, method.hclust=mhc, method.dist="correlation", use.cor="pairwise.complete.obs", nboot=1000,parallel=T)
+
+
+
+chemocode_tree <-as.phylo.pvclust(result_species)
+write.tree(chemocode_tree,file=here("results","gnps_output","custom_qemistree_CSCS",paste0(gsub(".tsv",".tre",file))))
+}
+
+```
+
